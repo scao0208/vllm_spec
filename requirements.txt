@@ -2,7 +2,6 @@ vllm==0.15.0
 compressed-tensors==0.13.0
 pandas==3.0.0
 pyarrow==23.0.0
-fastparquet==
 pydantic==2.12.5
 numpy>=2.2.6
 torch==2.9.1
