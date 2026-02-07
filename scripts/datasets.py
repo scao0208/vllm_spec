@@ -14,24 +14,47 @@ from pathlib import Path
 from typing import List, Optional
 
 
+def _find_parquet(path: Path, split: str = "test") -> Path:
+    """Find a parquet file in the dataset directory, preferring the given split."""
+    parquet_files = list(path.glob("**/*.parquet"))
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet file found in {path}")
+    # Prefer the requested split
+    for f in parquet_files:
+        if f.name.startswith(f"{split}-"):
+            return f
+    return parquet_files[0]
+
+
 def load_gsm8k(path: Path) -> List[str]:
     """Load GSM8K dataset from parquet file."""
     import pandas as pd
-    parquet_path = path / "main" / "test-00000-of-00001.parquet"
+    parquet_path = _find_parquet(path, "test")
     df = pd.read_parquet(parquet_path)
     return df["question"].tolist()
 
 
 def load_humaneval(path: Path) -> List[str]:
-    """Load HumanEval dataset from JSONL file."""
-    # Find jsonl file
+    """Load HumanEval dataset from parquet or JSONL file."""
+    import pandas as pd
+
+    # Try parquet first
+    parquet_files = list(path.glob("**/*.parquet"))
+    if parquet_files:
+        pf = _find_parquet(path, "test")
+        df = pd.read_parquet(pf)
+        if "prompt" in df.columns:
+            return df["prompt"].tolist()
+
+    # Try JSONL
     if path.is_file():
         jsonl_path = path
     else:
-        jsonl_files = list(path.glob("*.jsonl"))
-        if not jsonl_files:
-            raise FileNotFoundError(f"No JSONL file found in {path}")
-        jsonl_path = jsonl_files[0]
+        jsonl_files = list(path.glob("**/*.jsonl"))
+        if jsonl_files:
+            jsonl_path = jsonl_files[0]
+        else:
+            raise FileNotFoundError(f"No parquet or JSONL file found in {path}")
 
     prompts = []
     with open(jsonl_path) as f:
@@ -42,20 +65,21 @@ def load_humaneval(path: Path) -> List[str]:
 
 
 def load_mbpp(path: Path) -> List[str]:
-    """Load MBPP dataset from JSONL or parquet file."""
+    """Load MBPP dataset from parquet or JSONL file."""
     import pandas as pd
 
     # Try parquet first
     parquet_files = list(path.glob("**/*.parquet"))
     if parquet_files:
-        df = pd.read_parquet(parquet_files[0])
+        pf = _find_parquet(path, "test")
+        df = pd.read_parquet(pf)
         if "text" in df.columns:
             return df["text"].tolist()
         elif "prompt" in df.columns:
             return df["prompt"].tolist()
 
     # Try JSONL
-    jsonl_files = list(path.glob("*.jsonl"))
+    jsonl_files = list(path.glob("**/*.jsonl"))
     if jsonl_files:
         prompts = []
         with open(jsonl_files[0]) as f:

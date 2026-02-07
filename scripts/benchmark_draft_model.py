@@ -14,7 +14,7 @@ Usage:
         --draft-tensor-parallel-size 4 \
         --max-tokens 512 \
         --max-num-seqs 2 \
-        --gsm8k /home/dataset_model/dataset/gsm8k \
+        --dataset /home/dataset_model/dataset/gsm8k \
         --enforce-eager
 """
 
@@ -25,7 +25,8 @@ import time
 import torch
 from vllm import LLM, SamplingParams
 from vllm.v1.metrics.reader import Counter, Vector
-from choices import mc_sim_8b_12, mc_sim_8b_512 
+from choices import mc_sim_8b_12, mc_sim_8b_512
+from datasets import detect_and_load
 
 SAMPLE_PROMPTS = [
     "Write a Python function to implement binary search.",
@@ -126,10 +127,10 @@ def parse_args():
         help="Use mc_sim_8b_512 tree structure for speculation",
     )
     parser.add_argument(
-        "--gsm8k",
+        "--dataset",
         type=str,
         default=None,
-        help="Path to GSM8K dataset directory (e.g., /home/dataset_model/dataset/gsm8k)",
+        help="Path to dataset directory (auto-detects gsm8k, humaneval, mbpp from path name)",
     )
     parser.add_argument(
         "--max-num-seqs",
@@ -189,19 +190,17 @@ def main():
     args = parse_args()
 
     # Load prompts
-    if args.gsm8k:
-        import pandas as pd
-        df = pd.read_parquet(f"{args.gsm8k}/main/test-00000-of-00001.parquet")
-        prompts = df["question"].tolist()
-        print(f"Loaded {len(prompts)} prompts from GSM8K dataset")
+    if args.dataset:
+        prompts = detect_and_load(args.dataset, args.num_prompts)
     elif args.prompts_file:
         with open(args.prompts_file) as f:
             prompts = json.load(f)
+        if args.num_prompts is not None:
+            prompts = prompts[: args.num_prompts]
     else:
         prompts = SAMPLE_PROMPTS
-
-    if args.num_prompts is not None:
-        prompts = prompts[: args.num_prompts]
+        if args.num_prompts is not None:
+            prompts = prompts[: args.num_prompts]
     print(f"Running with {len(prompts)} prompts")
 
     # Setup tensor parallel size
