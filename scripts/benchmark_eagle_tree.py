@@ -12,7 +12,8 @@ Usage:
     python benchmark_eagle_tree.py \
         --target-model meta-llama/Llama-3.3-70B-Instruct \
         --draft-model meta-llama/Llama-3.1-8B-Instruct \
-        --tensor-parallel-size 4 \
+        --tensor-parallel-size 2 \
+        --draft-tensor-parallel-size 2 \
         --tree-size 512 \
         --dataset /path/to/gsm8k
 
@@ -20,7 +21,8 @@ Usage:
     python benchmark_eagle_tree.py \
         --target-model meta-llama/Llama-3.3-70B-Instruct \
         --draft-model meta-llama/Llama-3.1-8B-Instruct \
-        --tensor-parallel-size 4 \
+        --tensor-parallel-size 2 \
+        --draft-tensor-parallel-size 2 \
         --tree-size 512 \
         --use-eagle-kernel \
         --dataset /path/to/gsm8k
@@ -35,6 +37,11 @@ from vllm import LLM, SamplingParams
 from vllm.v1.metrics.reader import Counter, Vector
 from eagle_tree_choices import EAGLE_TREES, get_tree_stats
 from datasets import detect_and_load
+
+# Patch vLLM's MAX_SPEC_LEN to support 512+ token trees.
+# Default is 128 which is too small for our large tree benchmarks.
+import vllm.v1.sample.rejection_sampler as _rs
+_rs.MAX_SPEC_LEN = 1024
 
 SAMPLE_PROMPTS = [
     "Write a Python function to implement binary search.",
@@ -301,7 +308,8 @@ def parse_args():
     parser.add_argument("--tree-size", type=int, default=512, choices=[256, 512, 1024],
                         help="EAGLE tree size (256, 512, or 1024 tokens)")
     parser.add_argument("--tensor-parallel-size", type=int, default=None)
-    parser.add_argument("--draft-tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--draft-tensor-parallel-size", type=int, default=None,
+                        help="Draft model TP size (defaults to --tensor-parallel-size)")
     parser.add_argument("--num-prompts", type=int, default=None)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -342,19 +350,21 @@ def main():
 
     # Setup TP
     tp_size = args.tensor_parallel_size or torch.cuda.device_count()
+    draft_tp_size = args.draft_tensor_parallel_size or tp_size
 
     print(f"\nScenario A: EAGLE Expanded Tree")
     print(f"Target model: {args.target_model}")
     print(f"Draft model: {args.draft_model}")
     print(f"Tree size: {args.tree_size} nodes, depth {stats['max_depth']}")
     print(f"Kernel: {'ea_attn_exp' if args.use_eagle_kernel else 'vllm_unified'}")
+    print(f"TP: target={tp_size}, draft={draft_tp_size}")
 
     spec_config = {
         "method": args.method,
         "model": args.draft_model,
         "num_speculative_tokens": len(tree),
         "speculative_token_tree": str(tree),
-        "draft_tensor_parallel_size": args.draft_tensor_parallel_size,
+        "draft_tensor_parallel_size": draft_tp_size,
     }
 
     llm = LLM(
