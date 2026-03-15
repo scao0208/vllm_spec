@@ -1,0 +1,4 @@
+# ninja log v7
+4	64057	1771744097353612484	/home/siyu/Documents/vllm_spec_scenario_a/csrc/build/temp.linux-x86_64-cpython-311/bitmap_attention.o	1d7f43a64c77ad95
+7	66804	1771759871022591190	/home/siyu/Documents/vllm_spec_scenario_a/csrc/build/temp.linux-x86_64-cpython-311/paged_bitmap_attention.o	531f15b95dee8f1d
+5	63710	1771763469515950954	/home/siyu/Documents/vllm_spec_scenario_a/csrc/build/temp.linux-x86_64-cpython-311/paged_bitmap_attention/launch.o	2f72c27ea6c6a4c

@@ -113,7 +113,20 @@ def generate_deep_eagle_tree(top_k, depth, total_tokens):
     return tree_choices[:total_tokens]
 
 
+# Standard EAGLE tree from mc_sim_7b_63 (Monte Carlo optimized, 25 nodes, depth 5)
+# Source: eagle/model/choices.py from EAGLE project
+mc_sim_7b_63 = [
+    (0,), (1,), (2,), (3,),
+    (0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (2, 0), (2, 1), (3, 0),
+    (0, 0, 0), (0, 0, 1), (0, 0, 2), (0, 1, 0), (0, 1, 1), (0, 2, 0), (0, 2, 1), (1, 0, 0),
+    (0, 0, 0, 0), (0, 0, 0, 1), (0, 0, 0, 2),
+    (0, 0, 0, 0, 0), (0, 0, 0, 0, 1),
+]
+
 # Pre-computed trees of various sizes
+# ~64 tokens, 8 depth, top_k=6 (small baseline)
+eagle_tree_64 = generate_deep_eagle_tree(top_k=6, depth=8, total_tokens=64)
+
 # ~256 tokens, 12 depth, top_k=8
 eagle_tree_256 = generate_deep_eagle_tree(top_k=8, depth=12, total_tokens=256)
 
@@ -123,10 +136,48 @@ eagle_tree_512 = generate_deep_eagle_tree(top_k=10, depth=14, total_tokens=512)
 # ~1024 tokens, 16 depth, top_k=12
 eagle_tree_1024 = generate_deep_eagle_tree(top_k=12, depth=16, total_tokens=1024)
 
+def generate_regular_tree(branching_factors):
+    """Generate a regular tree with uniform branching at each level.
+
+    This produces trees compatible with vLLM's propose_tree() which requires
+    child_drafts_per_level[i] = num_nodes[i] / num_nodes[i-1] to be an integer.
+
+    Args:
+        branching_factors: List [k1, k2, ...] where ki is the number of
+            children per parent at depth i. Tree depth = len(branching_factors).
+
+    Returns:
+        List of tuples representing tree node paths, sorted breadth-first.
+    """
+    tree = []
+    parents = [()]  # virtual root
+    for k in branching_factors:
+        new_level = []
+        for parent in parents:
+            for c in range(k):
+                node = parent + (c,)
+                tree.append(node)
+                new_level.append(node)
+        parents = new_level
+    return sorted(tree, key=lambda x: (len(x), x))
+
+
+# Regular trees with uniform branching (compatible with propose_tree())
+# regular_256: [4, 2, 2, 2, 2, 2] → 4+8+16+32+64+128 = 252 nodes, depth 6
+regular_tree_256 = generate_regular_tree([4, 2, 2, 2, 2, 2])
+
+# regular_512: [2, 2, 2, 2, 2, 2, 2, 2] → 2+4+8+16+32+64+128+256 = 510 nodes, depth 8
+regular_tree_512 = generate_regular_tree([2, 2, 2, 2, 2, 2, 2, 2])
+
+
 EAGLE_TREES = {
-    256: eagle_tree_256,
-    512: eagle_tree_512,
-    1024: eagle_tree_1024,
+    "mc_sim_7b_63": mc_sim_7b_63,
+    "generated_64": eagle_tree_64,
+    "generated_256": eagle_tree_256,
+    "generated_512": eagle_tree_512,
+    "generated_1024": eagle_tree_1024,
+    "regular_256": regular_tree_256,
+    "regular_512": regular_tree_512,
 }
 
 
