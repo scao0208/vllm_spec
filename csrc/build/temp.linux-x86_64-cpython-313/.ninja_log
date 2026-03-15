@@ -1,4 +1,0 @@
-# ninja log v7
-4	65518	1771767935032261005	/home/siyu/Documents/vllm_spec_scenario_a/csrc/build/temp.linux-x86_64-cpython-313/paged_bitmap_attention/launch.o	6f20191323dc1a87
-24	65780	1771768014428472010	/home/siyu/Documents/vllm_spec_scenario_a/csrc/build/temp.linux-x86_64-cpython-313/paged_bitmap_attention/launch.o	6f20191323dc1a87
-22	66188	1771768397908519820	/home/siyu/Documents/vllm_spec_scenario_a/csrc/build/temp.linux-x86_64-cpython-313/paged_bitmap_attention/launch.o	6f20191323dc1a87
