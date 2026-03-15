@@ -6,6 +6,7 @@ Supported datasets:
 - humaneval: Code generation tasks
 - mbpp: Python programming problems
 - longbench: Long-context QA (LongBench v2, filtered < 128K tokens)
+- sharegpt: Multi-turn conversation data (first human turn extracted)
 
 Auto-detects dataset type from path.
 """
@@ -136,6 +137,33 @@ def load_longbench(path: Path, max_tokens: Optional[int] = None) -> List[str]:
     return prompts
 
 
+def load_sharegpt(path: Path) -> List[str]:
+    """Load ShareGPT dataset from JSON file.
+
+    Extracts the first human turn from each conversation.
+    Expects a JSON list of objects with 'conversations' field.
+    """
+    if path.is_file() and path.suffix == ".json":
+        json_path = path
+    else:
+        json_files = list(path.glob("**/*.json"))
+        if not json_files:
+            raise FileNotFoundError(f"No JSON file found in {path}")
+        json_path = json_files[0]
+
+    with open(json_path) as f:
+        data = json.load(f)
+
+    prompts = []
+    for item in data:
+        conversations = item.get("conversations", [])
+        for turn in conversations:
+            if turn.get("from") == "human":
+                prompts.append(turn["value"])
+                break
+    return prompts
+
+
 def detect_and_load(dataset_path: str, num_prompts: Optional[int] = None,
                     max_tokens: Optional[int] = None) -> List[str]:
     """Auto-detect dataset type from path and load it.
@@ -164,10 +192,13 @@ def detect_and_load(dataset_path: str, num_prompts: Optional[int] = None,
     elif "longbench" in path_lower:
         prompts = load_longbench(path, max_tokens=max_tokens)
         dataset_name = "longbench_v2"
+    elif "sharegpt" in path_lower:
+        prompts = load_sharegpt(path)
+        dataset_name = "sharegpt"
     else:
         raise ValueError(
             f"Cannot auto-detect dataset type from path: {dataset_path}\n"
-            "Path should contain 'gsm8k', 'humaneval', 'mbpp', or 'longbench'"
+            "Path should contain 'gsm8k', 'humaneval', 'mbpp', 'longbench', or 'sharegpt'"
         )
 
     print(f"Loaded {len(prompts)} prompts from {dataset_name} dataset")
