@@ -1,0 +1,399 @@
+================================================================================
+  BITMAP-DRIVEN SPARSE ATTENTION KERNEL — DATAFLOW DIAGRAM
+  File: csrc/bitmap_attention.cu
+  Architecture: Two-stage FlashAttention with bitmap block skipping
+================================================================================
+
+
+1. SERVER-LEVEL DATA FLOW (End-to-End Pipeline)
+================================================================================
+
+  Python Host (CPU)                          GPU Kernel
+  ==================                         ==========
+
+  tree_choices
+       |
+       v
+  precompute_bitmap_metadata()        make_dense_stage1_indices()
+  (bitmap_sparse_attention.py)        (bitmap_sparse_attention.py)
+       |                                     |
+       | ancestor_indices                    | past_len, BLOCK_N
+       | → per-q_block union                 | → arange(num_past_blocks)
+       | → pack into uint64 words            v
+       v                              stage1_block_indices
+  bitmaps [num_q_blocks, W] int64     [num_past_blocks] int32
+       |                                     |
+       '--------.    .----------------------'
+                |    |
+  Q [B, H, N_Q, D]  fp16  -----------.  |  |
+  K [B, H, N_KV, D] fp16  ----------.|  |  |
+  V [B, H, N_KV, D] fp16  ---------.|.  |  |
+  tree_mask [N_Q, N_Q] fp16  ------.|.|  |  |
+  sm_scale, past_len  -----------..|.|.  |  |
+                                 |||||   |  |
+                                 vvvvv   v  v
+                          bitmap_attention_fwd()
+                          (PyTorch C++ Extension)
+                                 |
+                                 | grid = (num_q_blocks, H, B)
+                                 | threads = BLOCK_M per block
+                                 | smem = 48KB (BM=128, D=128)
+                                 v
+                     bitmap_attention_fwd_kernel<<<>>>
+                                 |
+                         .-------+-------.
+                         |               |
+                         v               v
+                     Stage 1         Stage 2
+                  (block-index)  (bitmap tree)
+                   past context    tree region
+                         |               |
+                         '-------+-------'
+                                 |
+                                 v
+                          O [B, H, N_Q, D]
+                          (output, fp16)
+
+
+2. MEMORY HIERARCHY — Where Data Lives at Each Step
+================================================================================
+
+  .---------------------------------------------------------------------------.
+  |  HBM (Global Memory / VRAM)                                               |
+  |                                                                            |
+  |  Q [B, H, N_Q, D] fp16          K [B, H, N_KV, D] fp16                   |
+  |  V [B, H, N_KV, D] fp16         O [B, H, N_Q, D] fp16  (output)          |
+  |  tree_mask [N_Q, N_Q] fp16       bitmaps [num_q_blocks, W] int64          |
+  |  stage1_block_indices [num_past_blocks] int32                              |
+  |                                                                            |
+  |  Read once:  Q (at kernel start)                                           |
+  |  Read/iter:  K, V tiles (per KV block), tree_mask tiles (Stage 2)          |
+  |  Read/iter:  stage1_block_indices[bi] (Stage 1, int32 per block, L1-cached)|
+  |  Read once:  bitmaps (per bitmap word w, Stage 2)                          |
+  |  Write once: O (at kernel end)                                             |
+  '---------------------------------------------------------------------------'
+       |  global loads (collaborative, all threads)       ^ global store
+       |                                                  | (valid threads)
+       v                                                  |
+  .---------------------------------------------------------------------------.
+  |  L2 Cache (implicit, hardware-managed)                                     |
+  |                                                                            |
+  |  Hot data: Q tile, early KV blocks, bitmap words (tiny: 8B each)           |
+  |  Reuse: Q tile stays hot across all KV blocks (same q_block)               |
+  |         Adjacent q_blocks share similar KV blocks → L2 reuse               |
+  '---------------------------------------------------------------------------'
+       |                                                  ^
+       v                                                  |
+  .---------------------------------------------------------------------------.
+  |  SMEM (Shared Memory — per thread block, 48KB for BM=128, D=128)           |
+  |                                                                            |
+  |  Layout (contiguous in smem_raw[]):                                        |
+  |                                                                            |
+  |  +----------------------------------+  offset 0                            |
+  |  | smem_q [BLOCK_M][HEAD_DIM]       |  128 x 128 x 2B = 32,768 B          |
+  |  | (Q tile — loaded once at start)  |                                      |
+  |  +----------------------------------+  offset 32,768                       |
+  |  | smem_kv [BLOCK_N][HEAD_DIM]      |  32 x 128 x 2B  =  8,192 B          |
+  |  | (K tile, then V tile — reloaded) |                                      |
+  |  +----------------------------------+  offset 40,960                       |
+  |  | smem_tmask [BLOCK_M][BLOCK_N]    |  128 x 32 x 2B  =  8,192 B          |
+  |  | (tree mask tile — Stage 2 only)  |                                      |
+  |  +----------------------------------+  offset 49,152                       |
+  |  | smem_bitmap                      |  1 x uint64     =      8 B          |
+  |  | (broadcast bitmap word)          |                                      |
+  |  +----------------------------------+  offset 49,160                       |
+  |                                                                            |
+  |  Total: 49,160 B ~ 48 KB                                                  |
+  '---------------------------------------------------------------------------'
+       |  SMEM reads (per-thread, coalesced)              ^  SMEM writes
+       v                                                  |  (collaborative)
+  .---------------------------------------------------------------------------.
+  |  Registers (per thread — thread t owns query row t)                        |
+  |                                                                            |
+  |  Persistent (lifetime = entire kernel):                                    |
+  |    o_acc[HEAD_DIM]  : float[128]  — output accumulator        (128 regs)   |
+  |    m_i              : float       — running softmax max         (1 reg)    |
+  |    l_i              : float       — running softmax sum         (1 reg)    |
+  |                                                                            |
+  |  Per-KV-block (recomputed each iteration):                                 |
+  |    s_vals[BLOCK_N]  : float[32]   — QK^T scores for tile      (32 regs)   |
+  |    dot              : float       — dot product accumulator     (1 reg)    |
+  |    p_j              : float       — softmax probability         (1 reg)    |
+  |    mask (Stage 2)   : uint64      — bitmap word copy            (2 regs)   |
+  |    bit, kv_block_id : int         — bitmap traversal state      (2 regs)   |
+  |                                                                            |
+  |  Total per thread: ~170 registers                                          |
+  '---------------------------------------------------------------------------'
+
+
+3. KERNEL EXECUTION FLOW — Per Thread Block
+================================================================================
+
+  Grid launch: (num_q_blocks, H, B)
+  Each block: BLOCK_M threads, each thread = one query row
+
+  blockIdx = (q_block, head, batch)
+
+  INIT
+  =====
+  tid = threadIdx.x
+  my_q = q_block * BLOCK_M + tid
+  Q_bh = Q + (batch * H * N_Q + head * N_Q) * D   // batch,head offset
+  K_bh = K + (batch * H * N_KV + head * N_KV) * D
+  V_bh = V + (batch * H * N_KV + head * N_KV) * D
+
+       All threads
+            |
+            v
+  +---------------------------+
+  | Load Q tile: HBM → SMEM  |  Q_bh[q_start : q_start+BM, :] → smem_q
+  | (collaborative, bounded)  |  Zero-pad if q_start+BM > N_Q
+  +---------------------------+
+            |
+            v
+       __syncthreads()
+            |
+            v
+  Init per-thread accumulators:
+    o_acc[0..D-1] = 0.0f
+    m_i = -FLT_MAX
+    l_i = 0.0f
+
+
+  STAGE 1: BLOCK-INDEX PAST CONTEXT [0, past_len)
+  ================================================
+
+  for bi = 0; bi < num_stage1_blocks; bi++:
+    block_id = stage1_block_indices[bi]   // int32 load (L1-cached)
+    kv_start = block_id * BLOCK_N
+  +-----------------------------------------------------------------------+
+  |                                                                       |
+  |  +-------------------------------+                                    |
+  |  | Load K tile: HBM → SMEM      |  K_bh[kv_start:+BN, :] → smem_kv  |
+  |  | (all threads, bounded)        |                                    |
+  |  +-------------------------------+                                    |
+  |              |                                                        |
+  |              v                                                        |
+  |         __syncthreads()                                               |
+  |              |                                                        |
+  |              v                                                        |
+  |  +-------------------------------+                                    |
+  |  | Compute QK^T (per thread)     |  for j in [0, BN):                 |
+  |  |   s_vals[j] = dot(smem_q[tid],|    dot = sum_d Q[d]*K[j,d]        |
+  |  |                smem_kv[j])    |    s_vals[j] = dot * sm_scale      |
+  |  |   * sm_scale                  |  (no mask — all past is visible)   |
+  |  +-------------------------------+                                    |
+  |              |                                                        |
+  |              v                                                        |
+  |         __syncthreads()                                               |
+  |              |                                                        |
+  |              v                                                        |
+  |  +-------------------------------+                                    |
+  |  | Load V tile: HBM → SMEM      |  V_bh[kv_start:+BN, :] → smem_kv  |
+  |  | (reuses smem_kv buffer)       |                                    |
+  |  +-------------------------------+                                    |
+  |              |                                                        |
+  |              v                                                        |
+  |         __syncthreads()                                               |
+  |              |                                                        |
+  |              v                                                        |
+  |  +-------------------------------+     ONLINE SOFTMAX UPDATE          |
+  |  | m_block = max(s_vals[:])      |     (FlashAttention-2 style)       |
+  |  | m_new = max(m_i, m_block)     |                                    |
+  |  | scale = exp2((m_i-m_new)*L2E) |     exp2f = single HW instr       |
+  |  | l_i *= scale                  |                                    |
+  |  | o_acc[:] *= scale             |     rescale previous accum         |
+  |  |                               |                                    |
+  |  | for j in [0, BN):             |                                    |
+  |  |   p_j = exp2((s[j]-m_new)*L2E|                                    |
+  |  |   l_i += p_j                  |                                    |
+  |  |   o_acc[:] += p_j * smem_kv[j]|     PV accumulation               |
+  |  | m_i = m_new                   |                                    |
+  |  +-------------------------------+                                    |
+  |              |                                                        |
+  |              v                                                        |
+  |         __syncthreads()                                               |
+  |              |                                                        |
+  +-------+-----------+-----------------------------------------------+   |
+          | next iter |                                                   |
+          '-----------'                                                   |
+  +-----------------------------------------------------------------------+
+
+
+  STAGE 2: BITMAP-DRIVEN SPARSE TREE ATTENTION [past_len, past_len + N_Q)
+  =========================================================================
+
+  bitmap_row = bitmaps + q_block * W
+
+  for w = 0; w < W; w++:          // iterate bitmap words
+  +-----------------------------------------------------------------------+
+  |                                                                       |
+  |  +-------------------------------+                                    |
+  |  | Broadcast bitmap word         |  tid==0: smem_bitmap = bitmap[w]   |
+  |  | HBM → SMEM → registers       |  __syncthreads()                   |
+  |  |                               |  mask = *smem_bitmap  (all threads)|
+  |  +-------------------------------+  __syncthreads()                   |
+  |              |                                                        |
+  |              v                                                        |
+  |                                                                       |
+  |  while (mask != 0):             // traverse set bits                  |
+  |  +===================================================================+|
+  |  ||                                                                  ||
+  |  ||  +-----------------------------+                                 ||
+  |  ||  | bit = __ffsll(mask) - 1     |  ctz: find lowest set bit       ||
+  |  ||  | mask &= (mask - 1)          |  clear lowest set bit           ||
+  |  ||  | kv_block_id = w*64 + bit    |  global block index             ||
+  |  ||  | kv_start = past_len +       |                                 ||
+  |  ||  |   kv_block_id * BLOCK_N     |                                 ||
+  |  ||  +-----------------------------+                                 ||
+  |  ||              |                                                   ||
+  |  ||              v                                                   ||
+  |  ||  +-----------------------------+                                 ||
+  |  ||  | Load K tile: HBM → SMEM    |  K_bh[kv_start:+BN] → smem_kv   ||
+  |  ||  +-----------------------------+                                 ||
+  |  ||              |                                                   ||
+  |  ||              v                                                   ||
+  |  ||  +-----------------------------+                                 ||
+  |  ||  | Load tree mask: HBM → SMEM |  tree_mask[q_blk, kv_blk]       ||
+  |  ||  | smem_tmask[BM][BN]         |  → smem_tmask                   ||
+  |  ||  | (collaborative, bounded)    |  -inf for out-of-bounds         ||
+  |  ||  +-----------------------------+                                 ||
+  |  ||              |                                                   ||
+  |  ||              v                                                   ||
+  |  ||         __syncthreads()                                          ||
+  |  ||              |                                                   ||
+  |  ||              v                                                   ||
+  |  ||  +-----------------------------+                                 ||
+  |  ||  | QK^T + tree mask (per thr) |  for j in [0, BN):              ||
+  |  ||  |   s[j] = dot(Q[tid],K[j])  |    dot = sum_d Q*K              ||
+  |  ||  |        * sm_scale           |    s[j] += smem_tmask[tid,j]    ||
+  |  ||  |        + smem_tmask[tid,j]  |    (0.0 = attend, -inf = skip) ||
+  |  ||  +-----------------------------+                                 ||
+  |  ||              |                                                   ||
+  |  ||              v                                                   ||
+  |  ||         __syncthreads()                                          ||
+  |  ||              |                                                   ||
+  |  ||              v                                                   ||
+  |  ||  +-----------------------------+                                 ||
+  |  ||  | Load V tile: HBM → SMEM    |  V_bh[kv_start:+BN] → smem_kv   ||
+  |  ||  +-----------------------------+                                 ||
+  |  ||              |                                                   ||
+  |  ||              v                                                   ||
+  |  ||         __syncthreads()                                          ||
+  |  ||              |                                                   ||
+  |  ||              v                                                   ||
+  |  ||  +-----------------------------+  ONLINE SOFTMAX UPDATE          ||
+  |  ||  | m_block = max(s[:])         |  (same as Stage 1)              ||
+  |  ||  | m_new, scale, rescale o_acc |                                 ||
+  |  ||  | p_j = exp2(...)             |                                 ||
+  |  ||  | o_acc[:] += p_j * V[j,:]   |                                 ||
+  |  ||  +-----------------------------+                                 ||
+  |  ||              |                                                   ||
+  |  ||              v                                                   ||
+  |  ||         __syncthreads()                                          ||
+  |  ||              |                                                   ||
+  |  ||  +-----------+-----------+                                       ||
+  |  ||  | mask != 0 → next bit |                                       ||
+  |  ||  | mask == 0 → exit     |                                       ||
+  |  ||  +-----------+-----------+                                       ||
+  |  ||                                                                  ||
+  |  +===================================================================+|
+  |              |                                                        |
+  +-------+-----------+-----------------------------------------------+   |
+          | next word |                                                   |
+          '-----------'                                                   |
+  +-----------------------------------------------------------------------+
+
+
+  FINALIZE
+  ========
+            |
+            v
+  +-------------------------------+
+  | if valid_q:                   |
+  |   inv_l = 1.0 / l_i          |
+  |   O[my_q, :] = o_acc * inv_l |  registers → HBM (fp16 output)
+  +-------------------------------+
+
+
+4. BITMAP TRAVERSAL DETAIL — What Happens at Each Bit
+================================================================================
+
+  Example: regular_512 tree, BLOCK_M=128, BLOCK_N=32
+  N_tree=511, num_kv_blocks=16, W=1 (single uint64 word)
+
+  Bitmap word for q_block 0 (rows 0-127):
+
+    bit:  0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15
+    set:  1  1  1  1  1  0  1  1  1  0  0  1  0  0  0  1
+          ^                 ^     ^        ^
+          |                 |     |        |
+     root block        skip!  ancestors  skip!
+     (always set)    no anc.
+
+    popcount = 10 active blocks out of 16 total (37.5% pruned)
+
+  Traversal:
+    mask = 0b1000100011011111 = 0x88DF
+
+    Iteration 1: __ffsll → bit 0, block 0, kv_start = past_len + 0
+                 mask = 0x88DE
+    Iteration 2: __ffsll → bit 1, block 1, kv_start = past_len + 32
+                 mask = 0x88DC
+    ...
+    Iteration 5: __ffsll → bit 4, block 4, kv_start = past_len + 128
+                 mask = 0x88C0
+    (bit 5 is 0 → SKIPPED — no K/V load, no QK^T, no PV)
+    Iteration 6: __ffsll → bit 6, block 6, kv_start = past_len + 192
+                 mask = 0x8880
+    ...
+    mask == 0 → exit while loop
+
+
+5. DATA VOLUME COMPARISON — Dense vs Bitmap (per q_block, per head)
+================================================================================
+
+  Config: regular_512, BLOCK_N=32, HEAD_DIM=128, fp16
+
+  Per KV block loaded:
+    K tile: 32 x 128 x 2B = 8,192 B
+    V tile: 32 x 128 x 2B = 8,192 B
+    Total KV per block:    16,384 B = 16 KB
+
+  Stage 1 (block-index, dense past, past_len=4096):
+    128 past blocks x 16 KB = 2,048 KB of KV data
+    + block index metadata: 128 x 4B = 512 B  (int32 per block, L1-cached)
+
+  Dense Stage 2:
+    16 KV blocks x 16 KB = 256 KB of KV data
+
+  Bitmap Stage 2 (typical ~10 active blocks):
+    10 KV blocks x 16 KB = 160 KB of KV data
+    + bitmap metadata:       8 B  (1 uint64 word)
+    Savings: 96 KB (37.5% reduction)
+
+  Tree mask tile (both kernels):
+    128 x 32 x 2B = 8 KB per KV block (loaded from SMEM, not HBM repeat)
+
+
+6. SMEM REUSE PATTERN — Timeline for One KV Block Iteration
+================================================================================
+
+  Time --->
+
+  smem_q:    [====== Q tile (persistent, loaded once) =====================]
+  smem_kv:   [=== K tile ===]  sync  [=== V tile ===]  sync  [=== K next ==
+  smem_tmask:    [= mask tile =]  sync  (read during QK^T)
+  smem_bitmap: [b]  (read once per word, stays until next word)
+
+  Registers:
+  s_vals:    [               compute QK^T              ]  (overwritten next)
+  o_acc:     [====== accumulating across all KV blocks =====================]
+  m_i, l_i:  [====== running softmax state ================================]
+
+
+================================================================================
+  KEY: BM=BLOCK_M, BN=BLOCK_N=32, D=HEAD_DIM, L2E=LOG2E=1.44269504
+  Grid: (ceil(N_Q/BM), H, B)    Threads: BM per block
+  BM selection: N_Q<=32→32, N_Q<=64→64, else→128
+================================================================================
