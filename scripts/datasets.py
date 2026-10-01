@@ -5,6 +5,7 @@ Supported datasets:
 - gsm8k: Math word problems
 - humaneval: Code generation tasks
 - mbpp: Python programming problems
+- longbench: Long-context QA (LongBench v2, filtered < 128K tokens)
 
 Auto-detects dataset type from path.
 """
@@ -91,12 +92,58 @@ def load_mbpp(path: Path) -> List[str]:
     raise FileNotFoundError(f"No dataset file found in {path}")
 
 
-def detect_and_load(dataset_path: str, num_prompts: Optional[int] = None) -> List[str]:
+def load_longbench(path: Path, max_tokens: Optional[int] = None) -> List[str]:
+    """Load LongBench v2 dataset from data.json.
+
+    Expects a JSON file with list of objects containing 'context' and 'question'.
+    Supports both the filtered version (longbench_v2_filtered/data.json with
+    'est_tokens' field) and the raw version (data.json without token counts).
+
+    Args:
+        path: Path to directory containing data.json, or direct path to json.
+        max_tokens: Optional upper bound on estimated token count per prompt.
+                    Only works with filtered data that has 'est_tokens' field.
+
+    Returns:
+        List of prompt strings (context + question).
+    """
+    if path.is_file() and path.suffix == ".json":
+        json_path = path
+    else:
+        json_path = path / "data.json"
+        if not json_path.exists():
+            # Search for any json file
+            json_files = list(path.glob("**/*.json"))
+            if not json_files:
+                raise FileNotFoundError(f"No JSON file found in {path}")
+            json_path = json_files[0]
+
+    with open(json_path) as f:
+        data = json.load(f)
+
+    prompts = []
+    for item in data:
+        # Skip if over token limit (when est_tokens is available)
+        if max_tokens and "est_tokens" in item:
+            if item["est_tokens"] > max_tokens:
+                continue
+
+        context = item.get("context", "")
+        question = item.get("question", "")
+        prompt = f"{context}\n\nQuestion: {question}\nAnswer:"
+        prompts.append(prompt)
+
+    return prompts
+
+
+def detect_and_load(dataset_path: str, num_prompts: Optional[int] = None,
+                    max_tokens: Optional[int] = None) -> List[str]:
     """Auto-detect dataset type from path and load it.
 
     Args:
         dataset_path: Path to dataset directory
         num_prompts: Optional limit on number of prompts
+        max_tokens: Optional max tokens per prompt (longbench only)
 
     Returns:
         List of prompt strings
@@ -114,10 +161,13 @@ def detect_and_load(dataset_path: str, num_prompts: Optional[int] = None) -> Lis
     elif "mbpp" in path_lower:
         prompts = load_mbpp(path)
         dataset_name = "mbpp"
+    elif "longbench" in path_lower:
+        prompts = load_longbench(path, max_tokens=max_tokens)
+        dataset_name = "longbench_v2"
     else:
         raise ValueError(
             f"Cannot auto-detect dataset type from path: {dataset_path}\n"
-            "Path should contain 'gsm8k', 'humaneval', or 'mbpp'"
+            "Path should contain 'gsm8k', 'humaneval', 'mbpp', or 'longbench'"
         )
 
     print(f"Loaded {len(prompts)} prompts from {dataset_name} dataset")

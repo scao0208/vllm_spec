@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Compiled shared objects / build artifacts
+*.so
+*.o
+*.a
+*.ptx
+build/
+*.egg-info/
+
+# Compiled CUDA test binaries (no extension)
+csrc/test_mma_debug
+csrc/test_mma_map
+csrc/test_quest_mma
+csrc/test_quest_mma_O0
+csrc/test_tensor_core
+csrc/test_tma
+csrc/test_tma_bulk
+csrc/test_tmem_100a
+csrc/test_tmem_ptx100a
+
+# Data files
+*.qdstrm
+*.log
+
+# Thirdparty (use submodules instead)
+thirdparty/Quest/
+thirdparty/SpInfer/
+thirdparty/cutlass/
