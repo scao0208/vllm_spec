@@ -65,8 +65,17 @@ def generate_deep_eagle_tree(top_k, depth, total_tokens):
     - Level 2: top_k/2 children per parent (from level 1)
     - Level 3+: branching decays, but top-0 chain always extends
     - Remaining budget fills breadth at shallow levels
+
+    The primary chain reaches min(depth, total_tokens). If the requested
+    depth/branching cannot fill the budget, return the available nodes.
     """
-    tree_choices = []
+    if top_k < 1 or depth < 0 or total_tokens < 0:
+        raise ValueError(
+            "top_k must be positive; depth and total_tokens must be nonnegative"
+        )
+    if depth == 0 or total_tokens == 0:
+        return []
+    depth = min(depth, total_tokens)
     level_nodes_by_depth = {}
 
     # Phase 1: Build the primary chain (top-0 at every level)
@@ -76,24 +85,25 @@ def generate_deep_eagle_tree(top_k, depth, total_tokens):
         chain.append(node)
 
     # Phase 2: Build breadth at each level with decaying branching
-    all_nodes = set()
+    # Reserve the full chain before breadth can consume the token budget.
+    all_nodes = set(chain)
 
-    # Level 1: full top_k
-    level_1 = [(k,) for k in range(top_k)]
-    for n in level_1:
-        all_nodes.add(n)
+    # Level 1: fill up to top_k, respecting the reserved chain's budget.
+    level_1 = [(0,)]
+    for k in range(1, top_k):
+        if len(all_nodes) >= total_tokens:
+            break
+        node = (k,)
+        all_nodes.add(node)
+        level_1.append(node)
     level_nodes_by_depth[1] = level_1
 
     # Level 2+: decay branching, always include chain
     for d in range(2, depth + 1):
         level_k = max(1, top_k // d)
-        new_level = []
-
-        # Always include chain node
+        # Include the reserved chain node in this level's expansion frontier.
         chain_node = (0,) * d
-        if chain_node not in all_nodes:
-            new_level.append(chain_node)
-            all_nodes.add(chain_node)
+        new_level = [chain_node]
 
         # Expand parents from previous level
         prev_level = level_nodes_by_depth.get(d - 1, [])
@@ -109,8 +119,7 @@ def generate_deep_eagle_tree(top_k, depth, total_tokens):
         level_nodes_by_depth[d] = new_level
 
     # Sort by (depth, path) as required by vLLM
-    tree_choices = sorted(all_nodes, key=lambda x: (len(x), x))
-    return tree_choices[:total_tokens]
+    return sorted(all_nodes, key=lambda x: (len(x), x))
 
 
 # Standard EAGLE tree from mc_sim_7b_63 (Monte Carlo optimized, 25 nodes, depth 5)

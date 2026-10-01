@@ -1,7 +1,7 @@
-import pytest
 import torch
 import torch.nn.functional as F
 import os
+from contextlib import nullcontext
 import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
@@ -9,6 +9,11 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 TRITON_AVAILABLE = True
+
+def _device_context(device):
+    # PyTorch also uses the "cuda" device type/API for ROCm tensors.
+    # Other backends must not initialize or switch a CUDA device.
+    return torch.cuda.device(device) if device.type == "cuda" else nullcontext()
 
 def _host_descriptor_pre_hook(nargs):
     BLOCK_M = nargs["BLOCK_M"]
@@ -294,6 +299,7 @@ def _attn_fwd(sm_scale, M,  #
     desc_o.store([qo_offset_y, 0], acc_masked) # store acc_masked to o matrix
 
 class _attention(torch.autograd.Function):
+    """Forward-only tree attention; no gradient kernel is implemented."""
 
     @staticmethod
     def forward(ctx, q, k, v, tree_mask, sm_scale, warp_specialize=True):
@@ -398,13 +404,8 @@ class _attention(torch.autograd.Function):
         tree_mask_rows_per_head = tree_mask_flat.shape[0] // (B * H)
         y_dim_tree_mask = tree_mask_flat.shape[0]
 
-        # Ensure all device-dependent code runs on correct device for multi-GPU support
-        # Get device index for explicit device handling
-        device_idx = q.device.index if q.device.index is not None else 0
-        prev_device = torch.cuda.current_device()
-        torch.cuda.set_device(device_idx)
-
-        try:
+        # Select the input device and restore it even if the kernel raises.
+        with _device_context(q.device):
             # Use TensorDescriptor only on supported hardware
             use_tensor_desc = supports_host_descriptor() and not (is_hopper() and warp_specialize)
             if use_tensor_desc:
@@ -459,9 +460,6 @@ class _attention(torch.autograd.Function):
                 warp_specialize=warp_specialize,  #
                 IS_HOPPER=is_hopper(),  #
                 **extra_kern_args)
-        finally:
-            # Restore previous device
-            torch.cuda.set_device(prev_device)
 
         # Vectorized output extraction: reshape to 3D, slice off padding, reshape to 4D
         # o_flat is [B*H*N_CTX_Q_PADDED, HEAD_DIM_K]
@@ -478,6 +476,12 @@ class _attention(torch.autograd.Function):
         ctx.N_CTX_Q = N_CTX_Q  # Save for backward pass
         ctx.N_CTX_KV = N_CTX_KV  # Save for backward pass
         return o
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        raise NotImplementedError(
+            "EAGLE tree attention is forward-only; backward is not implemented"
+        )
 
 
 try:
@@ -662,7 +666,7 @@ def _attn_fwd_strided(
 
 
 class _attention_strided(torch.autograd.Function):
-    """Strided attention with per-head TensorDescriptors - no padding, correct boundaries."""
+    """Forward-only strided attention with per-head TensorDescriptors."""
 
     @staticmethod
     def forward(ctx, q, k, v, tree_mask, sm_scale):
@@ -696,12 +700,8 @@ class _attention_strided(torch.autograd.Function):
         BLOCK_N = 32
         grid = (triton.cdiv(N_CTX_Q, BLOCK_M), B * H)
 
-        # Multi-GPU support
-        device_idx = q.device.index if q.device.index is not None else 0
-        prev_device = torch.cuda.current_device()
-        torch.cuda.set_device(device_idx)
-
-        try:
+        # PyTorch's device context also restores the device on launch failure.
+        with _device_context(q.device):
             _attn_fwd_strided[grid](
                 q, k, v, o, M, tree_mask,
                 sm_scale,
@@ -716,12 +716,16 @@ class _attention_strided(torch.autograd.Function):
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
             )
-        finally:
-            torch.cuda.set_device(prev_device)
 
         ctx.save_for_backward(q, k, v, o, M)
         ctx.sm_scale = sm_scale
         return o
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        raise NotImplementedError(
+            "EAGLE tree attention is forward-only; backward is not implemented"
+        )
 
 
 BATCH, N_HEADS = 4, 32
@@ -759,12 +763,16 @@ attention = _attention.apply
 @triton.testing.perf_report(configs)
 def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, device=DEVICE):
     assert mode in ["fwd", "bwd"]
+    if "triton" in provider and mode == "bwd":
+        raise NotImplementedError(
+            "Triton EAGLE tree attention is forward-only; use mode='fwd'"
+        )
     dtype = torch.float16
     ms = 0.0  # Initialize ms to avoid linter error
     if "triton" in provider:
-        q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-        k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-        v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device)
+        k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device)
+        v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device)
         if mode == "fwd" and "fp8" in provider:
             q = q.to(torch.float8_e5m2)
             k = k.to(torch.float8_e5m2)
@@ -772,15 +780,18 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, warp_specialize, mo
             v = v.permute(0, 1, 3, 2)
             v = v.to(torch.float8_e5m2)
         sm_scale = 1.3
-        fn = lambda: attention(q, k, v, causal, sm_scale, warp_specialize)
-        if mode == "bwd":
-            o = fn()
-            do = torch.randn_like(o)
-            fn = lambda: o.backward(do, retain_graph=True)
+        tree_mask = None
+        if causal:
+            # Additive mask: zero for visible keys, -inf for future keys.
+            # Construct it outside the timed region and broadcast over B/H.
+            tree_mask = torch.full(
+                (N_CTX, N_CTX), float('-inf'), dtype=dtype, device=device,
+            ).triu(1).unsqueeze(0).unsqueeze(0)
+        fn = lambda: attention(q, k, v, tree_mask, sm_scale, warp_specialize)
         ms = triton.testing.do_bench(fn)
 
     if provider == "flash":
-        qkv = torch.randn((BATCH, N_CTX, 3, H, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        qkv = torch.randn((BATCH, N_CTX, 3, H, HEAD_DIM), dtype=dtype, device=device, requires_grad=mode == "bwd")
         fn = lambda: flash_attn_func(qkv, causal=causal)
         if mode == "bwd":
             o = fn()

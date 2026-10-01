@@ -124,6 +124,31 @@ def parse_args():
     return parser.parse_args()
 
 
+def _single_token_decode(self, layer, query, key_cache, value_cache,
+                         output, decode_meta, seq_idx, q_start, kv_len):
+    """Run the usual paged attention path for one row of a mixed batch."""
+    from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+
+    descale_shape = (1, self.num_kv_heads)
+    unified_attention(
+        q=query[q_start:q_start + 1],
+        k=key_cache, v=value_cache,
+        out=output[q_start:q_start + 1],
+        cu_seqlens_q=decode_meta.query_start_loc[seq_idx:seq_idx + 2] - q_start,
+        max_seqlen_q=1,
+        seqused_k=decode_meta.seq_lens[seq_idx:seq_idx + 1],
+        max_seqlen_k=kv_len,
+        softmax_scale=self.scale, causal=True,
+        alibi_slopes=self.alibi_slopes,
+        window_size=self.sliding_window,
+        block_table=decode_meta.block_table[seq_idx:seq_idx + 1],
+        softcap=self.logits_soft_cap,
+        q_descale=None,
+        k_descale=layer._k_scale.expand(descale_shape),
+        v_descale=layer._v_scale.expand(descale_shape),
+    )
+
+
 def patch_tree_attention_with_eagle_kernel():
     """Monkey-patch vLLM's TreeAttentionImpl to use the ea_attn_exp kernel.
 
@@ -246,7 +271,13 @@ def patch_tree_attention_with_eagle_kernel():
             q_len = int(q_seqlens[seq_idx].item())
             kv_len = int(seq_lens[seq_idx].item())
 
-            if q_len <= 1:
+            if q_len == 0:
+                continue
+            if q_len == 1:
+                _single_token_decode(
+                    self, layer, query, key_cache, value_cache, output,
+                    decode_meta, seq_idx, q_start, kv_len,
+                )
                 continue
 
             # Extract query: [q_len, num_q_heads, head_size] -> [1, num_q_heads, q_len, head_size]
@@ -464,7 +495,13 @@ def patch_tree_attention_with_sparse_kernel(tree_choices):
             q_len = int(q_seqlens[seq_idx].item())
             kv_len = int(seq_lens[seq_idx].item())
 
-            if q_len <= 1:
+            if q_len == 0:
+                continue
+            if q_len == 1:
+                _single_token_decode(
+                    self, layer, query, key_cache, value_cache, output,
+                    decode_meta, seq_idx, q_start, kv_len,
+                )
                 continue
 
             # Extract query: [q_len, num_q_heads, head_size] -> [1, num_q_heads, q_len, head_size]
@@ -654,7 +691,13 @@ def patch_tree_attention_with_bitmap_kernel(tree_choices):
             q_len = int(q_seqlens[seq_idx].item())
             kv_len = int(seq_lens[seq_idx].item())
 
-            if q_len <= 1:
+            if q_len == 0:
+                continue
+            if q_len == 1:
+                _single_token_decode(
+                    self, layer, query, key_cache, value_cache, output,
+                    decode_meta, seq_idx, q_start, kv_len,
+                )
                 continue
 
             # Extract query: [q_len, num_q_heads, head_size] -> [1, num_q_heads, q_len, head_size]
